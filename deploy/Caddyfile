@@ -1,0 +1,18 @@
+# Automatic HTTPS for $DOMAIN (Let's Encrypt). Everything goes to the web
+# server, which forwards /api/v1/* to the API on the internal network.
+# CADDY_EMAIL_OPTION is "email <ACME_EMAIL>" when ACME_EMAIL is set and empty
+# otherwise (see docker-compose.yml) — a bare "email" line would not parse.
+{
+	{$CADDY_EMAIL_OPTION}
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
+	# The Prometheus endpoint is for the internal network only.
+	respond /metrics 404
+	reverse_proxy web:3001
+}

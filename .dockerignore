@@ -1,0 +1,12 @@
+# Never send secrets, local data or build output into an image.
+**/.env
+**/.env.*
+!**/.env.example
+**/node_modules
+**/.next
+**/dist
+**/coverage
+**/*.log
+.git
+New UI
+deploy/backups

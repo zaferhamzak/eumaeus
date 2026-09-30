@@ -1,0 +1,143 @@
+# Eumaeus — production stack.
+#   cp deploy/.env.example deploy/.env   (fill it in)
+#   docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d --build
+# Only Caddy is reachable from outside (80/443, automatic HTTPS). Postgres,
+# Redis, the API and the web server stay on the internal network. Every
+# service restarts on its own and has a health check.
+name: eumaeus
+
+x-app-env: &app-env
+  NODE_ENV: production
+  DATABASE_URL: postgresql://eumaeus:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/eumaeus
+  REDIS_URL: redis://redis:6379
+  SECRET_ENCRYPTION_KEY: ${SECRET_ENCRYPTION_KEY:?set SECRET_ENCRYPTION_KEY}
+  JEV_API_KEY: ${JEV_API_KEY:?set JEV_API_KEY}
+  APP_BASE_URL: https://${DOMAIN:?set DOMAIN}
+  SESSION_COOKIE_SECURE: "true"
+  TRUST_PROXY: 127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+  BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
+  BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
+  MAIL_INITIAL_SYNC_LIMIT: ${MAIL_INITIAL_SYNC_LIMIT:-200}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  # 1.1: instant mail (IMAP IDLE) and the worker watchdog.
+  MAIL_IDLE_ENABLED: ${MAIL_IDLE_ENABLED:-true}
+  MAIL_POLL_FALLBACK_SECONDS: ${MAIL_POLL_FALLBACK_SECONDS:-300}
+  MAIL_IDLE_MAX_CONNECTIONS: ${MAIL_IDLE_MAX_CONNECTIONS:-50}
+  WORKER_WATCHDOG_MINUTES: ${WORKER_WATCHDOG_MINUTES:-5}
+  SYSTEM_ALERT_EMAILS: ${SYSTEM_ALERT_EMAILS:-}
+  SYSTEM_ALERT_LOCALE: ${SYSTEM_ALERT_LOCALE:-en}
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: eumaeus
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: eumaeus
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eumaeus -d eumaeus"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    # Queues and sessions live here: keep them across restarts.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: { context: .., dockerfile: apps/api/Dockerfile }
+    image: eumaeus-api:1.2.0
+    restart: unless-stopped
+    command: ["api"]
+    environment: *app-env
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/v1/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  worker:
+    image: eumaeus-api:1.2.0
+    restart: unless-stopped
+    command: ["worker"]
+    environment: *app-env
+    depends_on:
+      api: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "node", "dist/scripts/workerHealth.js"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  web:
+    build:
+      context: ..
+      dockerfile: apps/web/Dockerfile
+      args: { API_BASE_URL: "http://api:3000" }
+    image: eumaeus-web:1.2.0
+    restart: unless-stopped
+    depends_on:
+      api: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/login').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports: ["80:80", "443:443", "443:443/udp"]
+    environment:
+      DOMAIN: ${DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    # The ACME email is optional: only add the "email" option when there is one.
+    entrypoint: ["sh", "-c", 'if [ -n "$$ACME_EMAIL" ]; then export CADDY_EMAIL_OPTION="email $$ACME_EMAIL"; fi; exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile']
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      web: { condition: service_healthy }
+
+  backup:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      PGHOST: postgres
+      PGUSER: eumaeus
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: eumaeus
+      BACKUP_DIR: /backups
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
+    volumes:
+      - ./backup:/scripts:ro
+      - ${BACKUP_PATH:-./backups}:/backups
+    entrypoint: ["sh", "/scripts/backup.sh", "--loop"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+volumes:
+  postgres-data:
+  redis-data:
+  caddy-data:
+  caddy-config:

@@ -1,0 +1,7 @@
+Eumaeus
+Copyright 2026 The Eumaeus Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Eumaeus uses Jev AI (https://api.typesafe.ai) for email analysis; a Jev API
+key is required and its use is governed by Jev's own terms.

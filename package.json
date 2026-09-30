@@ -1,0 +1,22 @@
+{
+  "name": "eumaeus",
+  "private": true,
+  "version": "1.2.0",
+  "packageManager": "pnpm@12.5.1",
+  "scripts": {
+    "sync": "pnpm --filter api sync",
+    "worker": "pnpm --filter api worker",
+    "api": "pnpm --filter api api",
+    "web": "pnpm --filter web exec next dev -p 3001",
+    "test": "pnpm --filter api test && pnpm --filter web test",
+    "typecheck": "pnpm --filter api typecheck && pnpm --filter web typecheck",
+    "lint": "pnpm --filter api lint && pnpm --filter web lint",
+    "build": "pnpm --filter api build && pnpm --filter web build",
+    "prisma:migrate": "pnpm --filter api prisma:migrate",
+    "prisma:generate": "pnpm --filter api prisma:generate",
+    "fastrun": "sh scripts/fastrun.sh",
+    "fastrun:bg": "sh scripts/fastrun.sh --bg",
+    "fastrun:stop": "sh scripts/fastrun.sh stop",
+    "fastrun:status": "sh scripts/fastrun.sh status"
+  }
+}

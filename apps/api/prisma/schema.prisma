@@ -1,0 +1,1438 @@
+// Phase 1-3 schema.
+//
+// Phase 1/2 implemented the tables needed for the ingestion vertical slice
+// (mailbox connection -> email discovery -> normalization -> persistence -> audit
+// trail -> human review safety net). Phase 3 adds AnalysisResult (the Jev decision
+// record). Tables required by later phases (a decision_schema TABLE — Phase 3 keeps
+// the schema as a versioned code constant, see modules/jev/schema.ts, since nothing
+// yet needs to reference it by FK — rule, rule_evaluation, destination,
+// destination_channel, action) are still deliberately NOT created — see
+// implementation-plan.md §C / §Z. Adding them later is additive (new tables +
+// new FK columns), not a rename of anything below.
+//
+// Row-Level Security (implementation-plan.md §C) is deliberately NOT enabled yet:
+// there is no HTTP/session layer in this phase to set the `app.tenant_id` session
+// variable RLS policies would key off, and shipping RLS policies with nothing
+// setting that variable would either silently deny everything or silently enforce
+// nothing — both worse than being explicit that tenant isolation in Phase 1 is
+// application-layer only (every query is scoped by tenantId, see modules/*).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// --- Phase 10 (draft): Organization / multi-mailbox foundation ---
+//
+// `Tenant` IS the Organization concept — see this migration's design note in
+// the Phase 10 report for why a second, separate `Organization` table was
+// deliberately NOT introduced (it would duplicate the exact same ownership
+// boundary every other model already keys off via `tenantId`). `slug` and
+// `status` are the two fields the Organization spec needs that Tenant didn't
+// already have; both are additive/nullable-or-defaulted so this migration
+// touches no existing data. The public API exposes this row as
+// "Organization" (see api/routes/organizations.ts, api/serializers/
+// organizationSerializer.ts) — "Tenant" remains the internal/DB name so the
+// ~15 existing models' `tenantId` columns and every existing service/route/
+// test referencing `request.tenantId`/`prisma.tenant` needed zero changes.
+model Tenant {
+  id   String @id @default(uuid())
+  name String
+
+  // Nullable: the pre-existing bootstrap tenant (created before this phase)
+  // has no slug and isn't forced to get one by this migration — set one later
+  // via PATCH /api/v1/organizations/:id if desired. Unique among non-null
+  // values only (Postgres allows multiple NULLs under a UNIQUE index).
+  slug String? @unique
+
+  // active | disabled — mirrors MailboxConnection.status's existing
+  // string-enum convention (never a DB enum, see that model's own comment).
+  status String @default("active")
+
+  // Per-organization control over Jev's own `human_review_required` signal,
+  // which forces Human Review BEFORE any rule is evaluated
+  // (modules/rules/evaluateRulesForEmail.ts). Previously a hardcoded 0.5 for
+  // everyone; a noisy inbox (newsletters, notifications) can trip it on most
+  // mail, so it's tunable per org. Disabling it means rules alone decide.
+  humanReviewSignalEnabled   Boolean @default(true) @map("human_review_signal_enabled")
+  humanReviewSignalThreshold Float   @default(0.5) @map("human_review_signal_threshold")
+
+  // Human Review digest email (modules/review/reviewDigest.ts): one summary
+  // per interval to members who can see reviews, never one email per item —
+  // a noisy inbox can put hundreds of items in review. Off by default so
+  // enabling SMTP never starts emailing people who didn't ask for it.
+  reviewDigestEnabled         Boolean   @default(false) @map("review_digest_enabled")
+  reviewDigestIntervalMinutes Int       @default(60) @map("review_digest_interval_minutes")
+  // The high-water mark: the next digest covers items created after this.
+  lastReviewDigestAt          DateTime? @map("last_review_digest_at")
+
+  // Phase 28+: email a member when review items are assigned to them —
+  // batched: one email once `threshold` assigned, not-yet-notified open items
+  // have gathered for that member (1 = on every assignment).
+  assignmentNotifyEnabled   Boolean @default(true) @map("assignment_notify_enabled")
+  assignmentNotifyThreshold Int     @default(1) @map("assignment_notify_threshold")
+
+  // Phase 13 forwarding guardrails (modules/destinations/executors/forwardExecutor.ts).
+  // forwardDailyLimit: max successful forwards in any rolling 24h window — a
+  // badly written rule must not be able to send thousands of emails.
+  // forwardAllowedDomains: empty = any domain (recipient verification still
+  // applies); non-empty = every recipient's domain must be listed.
+  forwardDailyLimit     Int      @default(200) @map("forward_daily_limit")
+  // Phase 21: language of emails to people who aren't users (forward recipients, forwarded-mail notes).
+  locale                String   @default("en")
+  // Phase 22: working hours for the email.business_hours condition —
+  // { timeZone, days: [1..7] (Mon=1), start: "HH:MM", end: "HH:MM" }; null = not set.
+  businessHours         Json?    @map("business_hours")
+  // Phase 20: retention. null = keep forever. Bodies (text, HTML, raw source)
+  // go after bodyRetentionDays; the whole email and everything derived from
+  // it after emailRetentionDays. Enforced by the hourly maintenance tick.
+  bodyRetentionDays     Int?     @map("body_retention_days")
+  emailRetentionDays    Int?     @map("email_retention_days")
+  forwardAllowedDomains String[] @default([]) @map("forward_allowed_domains")
+
+  // Phase 16: where mail from a blocked sender (SenderListEntry kind "block")
+  // goes. null = Human Review. A destination name, or "human_review".
+  blockDestinationRef String? @map("block_destination_ref")
+
+  // Phase 18: operational alerts. Emails go to members with
+  // organizations:write; the optional webhook (URL encrypted — it may carry a
+  // token) gets the same alerts as JSON.
+  alertEmailsEnabled       Boolean @default(true) @map("alert_emails_enabled")
+  alertWebhookUrlEncrypted String? @map("alert_webhook_url_encrypted")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  mailboxConnections    MailboxConnection[]
+  mailboxCredentials    MailboxCredential[]
+  emails                Email[]
+  auditEvents           AuditEvent[]
+  humanReviewItems      HumanReviewItem[]
+  analysisResults       AnalysisResult[]
+  rules                 Rule[]
+  ruleEvaluations       RuleEvaluation[]
+  routingDecisions      RoutingDecision[]
+  destinations          Destination[]
+  destinationChannels   DestinationChannel[]
+  destinationSecrets    DestinationSecret[]
+  actionExecutions      ActionExecution[]
+  ruleGraphs            RuleGraph[]
+  ruleGraphVersions     RuleGraphVersion[]
+  ruleNodes             RuleNode[]
+  memberships           Membership[]
+  apiKeys               ApiKey[]
+  questions             TenantQuestion[]
+  emailSources          EmailSource[]
+  forwardRecipients     ForwardRecipient[]
+  forwardDigestItems    ForwardDigestItem[]
+  notifyQueueItems      NotifyQueueItem[]
+  notifyChannelStates   NotifyChannelState[]
+  forwardDigestBatches  ForwardDigestBatch[]
+  ingestionSuppressions IngestionSuppression[]
+  senderListEntries     SenderListEntry[]
+  routingSuggestions    RoutingSuggestion[]
+  mailboxOAuthTokens    MailboxOAuthToken[]
+  alerts                Alert[]
+  outboundEmails        OutboundEmail[]
+  autoReplyRecords      AutoReplyRecord[]
+
+  @@map("tenant")
+}
+
+model MailboxConnection {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+
+  // Display name (Phase 10). Nullable — the pre-existing bootstrap mailbox
+  // row predates this field; new mailboxes created through the API are
+  // required to supply one at the Zod/validation layer, not the DB layer.
+  name String?
+
+  // 'imap' in Phase 1. 'gmail' is reserved for a later phase and will be added as
+  // an additional accepted value, not a rename of this column.
+  provider String
+
+  emailAddress String @map("email_address")
+
+  // Which RuleGraph (if any) routes this mailbox's email. Since Phase 12 this
+  // is live: when set and the graph is enabled, it REPLACES the flat Rule
+  // list for this mailbox (modules/rules/evaluateRulesForEmail.ts's
+  // evaluateAssignedRuleGraph); unset or disabled falls back to flat rules.
+  // Nullable — a mailbox need not have a graph assigned. A real FK (unlike RuleNode's onTrue/onFalse,
+  // which deliberately avoid FKs — see that model's comment): a mailbox and
+  // a rule graph are both independently-managed, already-existing top-level
+  // entities, not part of one batch-created structure, so Postgres-enforced
+  // referential integrity is the right, simple choice here. Cross-organization
+  // assignment (ruleGraph.tenantId !== this row's tenantId) is rejected at
+  // the application layer (modules/mail-providers/imap/manageMailboxConnections.ts)
+  // — a raw FK alone cannot express "same tenant only."
+  ruleGraphId String? @map("rule_graph_id")
+
+  // Non-secret connection config only: { host, port, tls, folder, username }.
+  // The mailbox password is NEVER stored here — it lives (encrypted) in
+  // MailboxCredential, one row per mailbox (Phase 10; see
+  // modules/mail-providers/imap/mailboxCredentials.ts). The legacy MAIL_PASSWORD
+  // env var only seeds the original bootstrap mailbox's credential row once
+  // (modules/tenancy/bootstrap.ts) — no mailbox-scoped IMAP operation reads it
+  // directly anymore.
+  providerConfig Json @map("provider_config")
+
+  // Phase 17: how Eumaeus signs in to this mailbox. "password" uses the
+  // MailboxCredential row; "oauth_google" / "oauth_microsoft" use the
+  // MailboxOAuthToken row (IMAP XOAUTH2). An OAuth mailbox whose refresh
+  // token stops working moves to status "reauth_required".
+  authType String @default("password") @map("auth_type")
+
+  status String @default("active") // active | reauth_required | disabled
+
+  // IMAP incremental-sync cursor. UIDs are only stable within one UIDVALIDITY epoch;
+  // see modules/mail-providers/imap/sync.ts for how a UIDVALIDITY change is handled.
+  lastUidValidity Int? @map("last_uid_validity")
+  lastSyncedUid   Int? @map("last_synced_uid")
+
+  // --- Phase 2: reconciliation lock + health state ---
+  // This doubles as BOTH the mailbox-level concurrency lock (an atomic conditional
+  // UPDATE on syncStatus/syncLockedAt is how two overlapping syncMailbox() calls for
+  // the same mailbox are prevented from racing, regardless of whether they were
+  // triggered by the manual CLI, the scheduler, or anything else later) AND the
+  // "small persisted health state" implementation-plan.md §U asks for — there is
+  // deliberately no separate lock table or lock service.
+  //
+  // syncStatus: idle | syncing | failed. Never "success" as a resting state — a
+  // completed sync returns to idle; lastSyncSuccessAt is what records that it
+  // happened. See sync.ts's tryAcquireSyncLock/releaseSyncLock* for the exact
+  // transitions and the staleness rule that recovers a lock abandoned by a crashed
+  // worker.
+  syncStatus              String    @default("idle") @map("sync_status")
+  syncLockedAt            DateTime? @map("sync_locked_at")
+  lastSyncAttemptAt       DateTime? @map("last_sync_attempt_at")
+  lastSyncSuccessAt       DateTime? @map("last_sync_success_at")
+  lastSyncFailureAt       DateTime? @map("last_sync_failure_at")
+  lastSyncError           String?   @map("last_sync_error")
+  // Syncs failed in a row since the last success (reset to 0 by a success).
+  consecutiveSyncFailures Int       @default(0) @map("consecutive_sync_failures")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant     Tenant             @relation(fields: [tenantId], references: [id])
+  ruleGraph  RuleGraph?         @relation(fields: [ruleGraphId], references: [id])
+  emails     Email[]
+  credential MailboxCredential?
+  oauthToken MailboxOAuthToken?
+
+  @@index([tenantId])
+  @@map("mailbox_connection")
+}
+
+// --- Phase 10: per-mailbox credentials ---
+//
+// Mirrors DestinationSecret exactly (same AES-256-GCM encryption via
+// modules/secrets/secretCrypto.ts, same "encrypted at rest, never returned by
+// any API response, resolved to plaintext in exactly one internal place")
+// but simpler: an IMAP mailbox needs exactly one secret (its password), never
+// several named ones the way a Destination can, so this is a 1:1 relation
+// (mailboxConnectionId is @unique) rather than DestinationSecret's
+// (destinationId, name) multi-row shape. Reusing the exact same crypto
+// module rather than inventing a second encryption scheme was an explicit
+// requirement (§"MAILBOX CREDENTIALS": "Use the project's existing
+// secret/encryption mechanism if one exists").
+model MailboxCredential {
+  id                  String @id @default(uuid())
+  tenantId            String @map("tenant_id")
+  mailboxConnectionId String @unique @map("mailbox_connection_id")
+
+  // Packed "v1.<ivHex>.<authTagHex>.<ciphertextHex>" — see secretCrypto.ts.
+  // Never plaintext. Never logged. Never included in an audit event payload
+  // or any API response (see api/serializers/mailboxSerializer.ts, which
+  // does not read this table at all).
+  encryptedValue String @map("encrypted_value")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant            Tenant            @relation(fields: [tenantId], references: [id])
+  mailboxConnection MailboxConnection @relation(fields: [mailboxConnectionId], references: [id])
+
+  @@map("mailbox_credential")
+}
+
+model Email {
+  id                  String @id @default(uuid())
+  tenantId            String @map("tenant_id")
+  mailboxConnectionId String @map("mailbox_connection_id")
+
+  provider String // 'imap'
+
+  // Identity strategy (do not change without reading implementation-plan.md's
+  // idempotency section): the IMAP UID is the primary identity, scoped to the
+  // mailbox connection AND the UIDVALIDITY epoch it was observed under. The RFC
+  // Message-ID (messageId below) is preserved as metadata only and is NEVER used
+  // to determine uniqueness, because it is attacker-controlled and frequently
+  // missing or duplicated in the wild.
+  externalId  String  @map("external_id") // IMAP UID, as string
+  uidValidity Int     @map("uid_validity")
+  messageId   String? @map("message_id")
+  threadId    String? @map("thread_id")
+
+  fromAddress  String   @map("from_address")
+  toAddresses  String[] @map("to_addresses")
+  ccAddresses  String[] @map("cc_addresses")
+  bccAddresses String[] @map("bcc_addresses")
+  subject      String?
+
+  receivedAt DateTime @map("received_at")
+
+  // Preprocessed/extracted bodies. htmlBody is opaque, untrusted data: it is never
+  // rendered as trusted application HTML and never interpreted as instructions.
+  // See "SECURITY" notes in modules/mail-providers/imap/parse.ts.
+  textBody String? @map("text_body")
+  htmlBody String? @map("html_body")
+
+  // Attachment CONTENT is never stored or parsed in Phase 1 — metadata only.
+  hasAttachments Boolean @default(false) @map("has_attachments")
+
+  // Phase 13: set at ingestion when the message carries Eumaeus's own
+  // X-Eumaeus-Forwarded header — i.e. it's a copy Eumaeus itself forwarded.
+  // The forward executor refuses to forward such a message again, so two
+  // monitored mailboxes can never ping-pong a message forever.
+  forwardedByEumaeus Boolean @default(false) @map("forwarded_by_jev_mail")
+
+  // Phase 19: headers an auto-reply must respect (RFC 3834) and a reply needs.
+  // headersCaptured is false for mail ingested before 0.19 — the auto-reply
+  // channel doesn't answer those, since it can't tell a mailing list or an
+  // auto-responder from a person.
+  headersCaptured       Boolean   @default(false) @map("headers_captured")
+  autoSubmitted         String?   @map("auto_submitted")
+  precedence            String?
+  listId                String?   @map("list_id")
+  replyToAddress        String?   @map("reply_to_address")
+  senderName            String?   @map("sender_name")
+  attachmentMeta        Json?     @map("attachment_meta") // [{ filename, contentType, size }]
+  // Phase 20: set when retention removed the bodies; subject, analysis and decision stay.
+  bodyPurgedAt          DateTime? @map("body_purged_at")
+  // Phase 22: threading headers, for the email.is_reply condition. Only known
+  // when threadHeadersCaptured (ingested from 0.22 on).
+  threadHeadersCaptured Boolean   @default(false) @map("thread_headers_captured")
+  inReplyTo             String?   @map("in_reply_to")
+  references            String?
+  // Phase 27: the receiving provider's SPF / DKIM / DMARC verdict, from its
+  // Authentication-Results (or Received-SPF) header — see senderAuth.ts. Only
+  // known when senderAuthCaptured (ingested from 0.27 on); null senderAuth then
+  // means the provider stamped no verdict.
+  senderAuthCaptured    Boolean   @default(false) @map("sender_auth_captured")
+  senderAuth            Json?     @map("sender_auth")
+
+  // Subset of the full architecture state machine (implementation-plan.md §H) that
+  // is reachable so far — Phase 4 adds `routing`; executing_actions/completed
+  // remain reserved for the future destinations/action phase (using them now
+  // would mean claiming an action was taken, which Phase 4 explicitly never does):
+  //   received        -> ingestion succeeded, nothing has processed it further yet
+  //   analyzing       -> the process-email job is calling Jev
+  //   analyzed        -> Jev analysis succeeded and was persisted (NOT "action taken")
+  //   routing         -> the Rule Engine produced a matched RoutingDecision — a
+  //                       destination is known, but nothing has been sent/executed
+  //   failed          -> processing exhausted its retries (ingestion OR analysis)
+  //   awaiting_review -> escalated to a HumanReviewItem (processing failure, no
+  //                       rule matched, or Jev's own human_review_required signal)
+  state          String
+  stateUpdatedAt DateTime @map("state_updated_at")
+  ingestedAt     DateTime @default(now()) @map("ingested_at")
+
+  tenant                Tenant                 @relation(fields: [tenantId], references: [id])
+  mailboxConnection     MailboxConnection      @relation(fields: [mailboxConnectionId], references: [id])
+  auditEvents           AuditEvent[]
+  humanReviewItems      HumanReviewItem[]
+  analysisResults       AnalysisResult[]
+  ruleEvaluations       RuleEvaluation[]
+  routingDecisions      RoutingDecision[]
+  actionExecutions      ActionExecution[]
+  source                EmailSource?
+  forwardDigestItems    ForwardDigestItem[]
+  notifyQueueItems      NotifyQueueItem[]
+  ingestionSuppressions IngestionSuppression[]
+
+  // This is THE idempotency guarantee: the database — not application code — refuses
+  // a second row for a UID already seen under the same mailbox connection and
+  // UIDVALIDITY epoch, no matter how many times sync runs or a job retries.
+  @@unique([mailboxConnectionId, uidValidity, externalId], name: "mailbox_message_identity")
+  @@index([tenantId, state])
+  // Phase 6: GET /api/v1/emails' default listing (a tenant's emails ordered by
+  // receivedAt, optionally filtered by mailbox) — added because the API's actual
+  // query pattern needs it, not speculatively.
+  @@index([tenantId, receivedAt])
+  // Phase 22: sender history conditions (first email, emails in the last 24h).
+  @@index([tenantId, fromAddress, receivedAt])
+  @@map("email")
+}
+
+model AuditEvent {
+  id       String  @id @default(uuid())
+  tenantId String  @map("tenant_id")
+  emailId  String? @map("email_id")
+
+  // Free-text, not a DB enum: new event types will be added continuously across
+  // future phases (rule_matched, action_succeeded, ...) and that must not require a
+  // migration every time. Email.state above IS a small closed set for that reason —
+  // this column deliberately is not.
+  eventType String @map("event_type")
+  payload   Json?
+  actor     String // 'system' for everything in Phase 1; a user id in later phases
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  email  Email? @relation(fields: [emailId], references: [id])
+
+  @@index([emailId])
+  // Phase 6: GET /api/v1/audit's tenant-wide, time-ordered listing.
+  @@index([tenantId, createdAt])
+  @@map("audit_event")
+}
+
+model HumanReviewItem {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  emailId  String @map("email_id")
+
+  reason String // low_confidence | unmatched | ambiguous | failed
+  // 'failed': ingestion/analysis processing exhausted retries.
+  // 'unmatched': the Rule Engine evaluated all active rules and none matched.
+  // 'ambiguous': Jev's own human_review_required signal forced escalation,
+  //   or the Rule Engine couldn't produce a decision at all (missing
+  //   analysis, invalid rule configuration) — see modules/rules/.
+  // 'low_confidence' remains unused until a future phase adds
+  // confidence-threshold-driven escalation independent of any rule.
+  status String @default("open") // open | resolved (a person decided) | superseded (closed by reprocessing)
+
+  assignedTo           String?   @map("assigned_to")
+  // When the current assignee got it, and when they were emailed about it
+  // (null = not yet — counts toward the organization's notify threshold).
+  assignedAt           DateTime? @map("assigned_at")
+  assignmentNotifiedAt DateTime? @map("assignment_notified_at")
+  resolvedAt           DateTime? @map("resolved_at")
+
+  // Phase 10.2: the human's classification of the outcome, set only when
+  // resolving — "approved" | "spam". Deliberately just a label, NOT an
+  // action: resolving still never touches Email.state or triggers any
+  // destination (see modules/review/resolveReview.ts's own long-standing
+  // warning against that). Null until resolved with an explicit resolution.
+  resolution String? @map("resolution")
+
+  // Phase 6: added because GET /api/v1/reviews needs a stable "created date" to
+  // filter/sort by — no timestamp existed on this model before (escalateToHumanReview
+  // never needed one; the operational read model does).
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  email  Email  @relation(fields: [emailId], references: [id])
+
+  // Phase 6: GET /api/v1/reviews' primary filter (status) + time ordering.
+  @@index([tenantId, status, createdAt])
+  @@map("human_review_item")
+}
+
+model AnalysisResult {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  emailId  String @map("email_id")
+
+  // "v1" — DecisionSchemaV1.version in modules/jev/schema.ts. The schema itself is a
+  // versioned code constant, not a DB row (see the file-level comment above): there
+  // is no rule engine yet to reference it by FK, so a table for it would be
+  // speculative. This column is what lets a future migration to a "v2" schema
+  // coexist with historical "v1" rows without any data loss or reinterpretation.
+  schemaVersion String @map("schema_version")
+
+  // The model string ECHOED BACK by Jev's own response (docs.typesafe.ai/api.md:
+  // response.model), not merely what we configured to request — this is the
+  // authoritative record of what actually served the request, independent of
+  // config drift. Always the pinned version (e.g. "jev-1.13.0"), never "jev-latest".
+  jevModel String @map("jev_model")
+
+  // Raw, schema-validated Jev answers, keyed by question id, faithfully preserving
+  // each primitive's actual response shape (Noul: {noul}; Choice: {choice,
+  // probabilities, confidence}; Score: {score, legend?, probabilities, confidence})
+  // rather than being flattened into an invented shape — see modules/jev/response.ts.
+  // Null when status = "error" (nothing to normalize).
+  answers Json?
+
+  status       String // ok | error
+  errorClass   String? @map("error_class") // authentication | validation | rate_limit | server | timeout | connection | malformed_response
+  errorMessage String? @map("error_message")
+
+  // Metadata explicitly required by the architecture (implementation-plan.md §C) —
+  // NOT the raw request/response bodies, which would duplicate email content
+  // (already in Email.textBody/htmlBody) and are unnecessary to keep twice.
+  inputTokens    Int?    @map("input_tokens")
+  outputTokens   Int?    @map("output_tokens")
+  latencyMs      Int?    @map("latency_ms")
+  inputTruncated Boolean @default(false) @map("input_truncated")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  email  Email  @relation(fields: [emailId], references: [id])
+
+  // Immutable/append-only by convention (application code never updates a row here —
+  // see modules/jev/persistAnalysis.ts): a re-analysis after a failure, or a future
+  // schema version, always INSERTs a new row rather than overwriting history. The
+  // idempotency check that prevents duplicate CANONICAL (successful) analyses is a
+  // query — "does a status='ok' row already exist for this email+schema" — not a
+  // uniqueness constraint, because multiple 'error' rows before an eventual success
+  // are legitimate history, not duplicates.
+  @@index([emailId, schemaVersion, status])
+  @@map("analysis_result")
+}
+
+// --- Phase 4: Rule Engine ---
+//
+// Consumes AnalysisResult.answers + deterministic Email fields and decides WHERE
+// an email should go. Does NOT execute anything — `destinationRef` is a plain
+// string label (e.g. "customer-support"), not a foreign key, because a real
+// Destination table doesn't exist yet (a later phase). There is deliberately no
+// `decision_schema` table either — same reasoning as AnalysisResult's comment
+// above: nothing here needs to join against it by FK, so it stays a versioned
+// code constant (modules/jev/schema.ts) that this module never imports from.
+
+model Rule {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+
+  name    String
+  enabled Boolean @default(true)
+
+  // Lower priority number = evaluated first; first match wins. Uniqueness among
+  // ACTIVE rules is enforced at the application layer (modules/rules/manageRules.ts),
+  // not by a DB constraint — a hard unique(tenantId, priority) constraint would
+  // break the versioning pattern below, where an edited rule's old version is
+  // deactivated (not deleted) and can briefly coexist with its replacement.
+  priority Int
+
+  // The condition tree (see modules/rules/conditions.ts for the exact AST shape
+  // and field/operator vocabulary this is validated against at save time).
+  conditions Json
+
+  // Plain label, not a destination lookup — see this section's header comment.
+  destinationRef String @map("destination_ref")
+
+  // Versioning: editing a rule's conditions/priority/destination creates a NEW
+  // row (version incremented, previous row's deactivatedAt set) rather than
+  // mutating history — so a RuleEvaluation/RoutingDecision from last week keeps
+  // pointing at the exact configuration that was live when it was evaluated.
+  version       Int       @default(1)
+  deactivatedAt DateTime? @map("deactivated_at")
+  // Phase 25: every version of one rule shares this id (the first version's
+  // id), so its history can be listed and restored even across renames.
+  lineageId     String?   @map("lineage_id")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant           Tenant            @relation(fields: [tenantId], references: [id])
+  evaluations      RuleEvaluation[]
+  routingDecisions RoutingDecision[]
+
+  @@index([tenantId, enabled, priority])
+  @@index([tenantId, lineageId])
+  @@map("rule")
+}
+
+model RuleEvaluation {
+  id          String @id @default(uuid())
+  tenantId    String @map("tenant_id")
+  emailId     String @map("email_id")
+  ruleId      String @map("rule_id")
+  ruleVersion Int    @map("rule_version")
+
+  matched Boolean
+  // Explains WHY: per-leaf pass/fail detail, or an error description if the rule
+  // itself couldn't be evaluated (invalid field reference, wrong operator for a
+  // field's type, etc.) — an unevaluable rule is recorded as matched=false, never
+  // as a silent skip and never as an accidental match.
+  reason  Json
+
+  evaluatedAt DateTime @default(now()) @map("evaluated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  email  Email  @relation(fields: [emailId], references: [id])
+  rule   Rule   @relation(fields: [ruleId], references: [id])
+
+  @@index([emailId])
+  // Phase 14: per-rule match statistics (match counts over a time window).
+  @@index([ruleId, matched, evaluatedAt])
+  @@map("rule_evaluation")
+}
+
+model RoutingDecision {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+
+  // One decision per email: evaluation is deterministic (same AnalysisResult +
+  // same rule set always yields the same outcome), so re-evaluating an
+  // already-decided email is a no-op (see evaluateRulesForEmail.ts) rather than
+  // something that could produce a second, possibly-contradictory row.
+  // Phase 18: no longer unique — reprocessing an email supersedes its decision
+  // instead of overwriting it. "At most one CURRENT decision per email" is a
+  // partial unique index (email_id WHERE superseded_at IS NULL), added as raw
+  // SQL in the phase18 migration because Prisma can't express it.
+  emailId String @map("email_id")
+
+  // Phase 18: set when a reprocess replaced this decision. Past decisions (and
+  // the actions they ran) stay for the record.
+  supersededAt DateTime? @map("superseded_at")
+
+  // matched | unmatched | human_review_forced | invalid_config | missing_analysis
+  status String
+
+  matchedRuleId      String? @map("matched_rule_id")
+  matchedRuleVersion Int?    @map("matched_rule_version")
+  destinationRef     String? @map("destination_ref")
+
+  // Phase 12: set instead of matchedRule* when the email's mailbox has a
+  // RuleGraph assigned and it decided the route. graphPath is the ordered
+  // list of visited nodes with each node's full condition trace — the graph
+  // equivalent of the flat engine's per-rule RuleEvaluation rows.
+  ruleGraphId      String? @map("rule_graph_id")
+  ruleGraphVersion Int?    @map("rule_graph_version")
+  graphPath        Json?   @map("graph_path")
+
+  // Phase 16: set when an allow/block list entry decided this email. No FK:
+  // the entry may be deleted later; the pattern is kept for the record.
+  senderListEntryId String? @map("sender_list_entry_id")
+  senderListPattern String? @map("sender_list_pattern")
+
+  // Which AnalysisResult this decision was computed from — explicit provenance,
+  // not just "the latest one," in case of future re-evaluation policies.
+  // Null only for status="missing_analysis" — there is, by definition, no
+  // AnalysisResult to point at in that case.
+  analysisResultId String? @map("analysis_result_id")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant           Tenant            @relation(fields: [tenantId], references: [id])
+  email            Email             @relation(fields: [emailId], references: [id])
+  matchedRule      Rule?             @relation(fields: [matchedRuleId], references: [id])
+  ruleGraph        RuleGraph?        @relation(fields: [ruleGraphId], references: [id], onDelete: SetNull)
+  actionExecutions ActionExecution[]
+
+  // Phase 6: GET /api/v1/routing-decisions' tenant-wide, time-ordered listing.
+  @@index([tenantId, createdAt])
+  @@index([emailId])
+  @@map("routing_decision")
+}
+
+// --- Phase 5A: Destinations (Archive channel only) ---
+//
+// Human Review is deliberately NOT modeled here — it is a reserved destinationRef
+// value ("human_review") handled by modules/destinations/dispatchRoutingDecision.ts
+// before any Destination lookup happens, calling the existing escalateToHumanReview()
+// unchanged. See phase5-destinations-architecture.md (Revision 2) §7. It produces
+// no Destination/DestinationChannel/ActionExecution rows at all.
+
+model Destination {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+
+  name        String
+  description String?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant   Tenant               @relation(fields: [tenantId], references: [id])
+  channels DestinationChannel[]
+  secrets  DestinationSecret[]
+
+  // A rule's destinationRef resolves against this per-tenant name — see
+  // modules/destinations/resolveDestination.ts. Scoped by tenantId, never globally
+  // unique, so two tenants can each have their own "sales" destination.
+  @@unique([tenantId, name])
+  @@map("destination")
+}
+
+model DestinationChannel {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id") // denormalized, matches Email.tenantId's pattern — direct tenant-scoped queries, no join required
+
+  destinationId String @map("destination_id")
+
+  // Phase 5A: "archive". Phase 5B adds "webhook" — enforced in
+  // modules/destinations/manageDestinations.ts, not by a DB constraint (this column
+  // stays a plain string, matching AuditEvent.eventType's precedent, so adding a
+  // channel type is additive, not a migration).
+  type String
+
+  // Non-secret config only. For "archive": { folder: string }. For "webhook":
+  // { url: string, secretName?: string } — secretName, if set, names a
+  // DestinationSecret row (below) scoped to the same Destination; the config
+  // itself never contains the secret value.
+  config Json
+
+  enabled Boolean @default(true)
+
+  // Same edit = new-row-old-deactivated pattern as Rule — a later config edit must
+  // never reinterpret an already-recorded ActionExecution's provenance.
+  version       Int       @default(1)
+  deactivatedAt DateTime? @map("deactivated_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant               Tenant               @relation(fields: [tenantId], references: [id])
+  destination          Destination          @relation(fields: [destinationId], references: [id])
+  actionExecutions     ActionExecution[]
+  forwardDigestItems   ForwardDigestItem[]
+  notifyQueueItems     NotifyQueueItem[]
+  notifyState          NotifyChannelState?
+  forwardDigestBatches ForwardDigestBatch[]
+
+  @@index([tenantId, destinationId, enabled])
+  @@map("destination_channel")
+}
+
+// --- Phase 5B: Destination Secrets (Webhook channel) ---
+//
+// A secret is scoped to a Destination (not a specific channel — a Destination with
+// multiple webhook channels could share one signing key), never stored in
+// plaintext. Encrypted at the application layer with AES-256-GCM BEFORE this row is
+// ever written — see modules/secrets/secretCrypto.ts for the exact packed format.
+// Nothing in this table, and no query against it, ever returns plaintext to a
+// caller outside the execution layer; see modules/destinations/manageSecrets.ts's
+// deliberate split between "safe metadata" functions and the one internal
+// plaintext-resolving function used only at execution time.
+model DestinationSecret {
+  id            String @id @default(uuid())
+  tenantId      String @map("tenant_id")
+  destinationId String @map("destination_id")
+
+  // Scoped to the destination, not globally unique — e.g. "webhook_signing_key"
+  // can exist once per destination. Looked up by (destinationId, name).
+  name String
+
+  // Packed "v1.<ivHex>.<authTagHex>.<ciphertextHex>" (AES-256-GCM). Never
+  // plaintext. Never logged, never included in an audit event or ActionExecution
+  // metadata.
+  encryptedValue String @map("encrypted_value")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant      Tenant      @relation(fields: [tenantId], references: [id])
+  destination Destination @relation(fields: [destinationId], references: [id])
+
+  @@unique([destinationId, name])
+  @@map("destination_secret")
+}
+
+// One row PER ATTEMPT (phase5-destinations-architecture.md Revision 2 §5) — NOT a
+// mirror of AnalysisResult's append-only-only pattern. Created as status="pending"
+// BEFORE the external/IMAP operation is attempted, then updated EXACTLY ONCE, in
+// place, to a terminal status after. Across attempts sharing one idempotencyKey,
+// rows accumulate (a retry inserts a new row, never reuses/resets a prior one) —
+// "append-only across attempts, single in-place finalization within one attempt."
+//
+// No separate "logical execution" table: idempotencyKey IS the grouping identity
+// across an attempt sequence; attemptNumber = count(prior rows sharing this key) + 1.
+//
+// Race protection: see this migration's raw-SQL addendum — a partial unique index
+// on (idempotency_key) WHERE status = 'pending' makes it impossible for two
+// concurrent callers to both hold a pending row for the same logical execution,
+// enforced by Postgres, not by an application-level findFirst-then-create check.
+model ActionExecution {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  emailId  String @map("email_id")
+
+  routingDecisionId    String @map("routing_decision_id") // -> RoutingDecision, which already carries matchedRuleId/matchedRuleVersion — not duplicated here
+  destinationChannelId String @map("destination_channel_id")
+
+  // Denormalized at execution time, matching RuleEvaluation's real precedent of
+  // storing ruleId AND ruleVersion even though ruleId alone (immutable-per-version)
+  // would technically be enough — kept consistent with that established style.
+  channelType    String @map("channel_type")
+  channelVersion Int    @map("channel_version")
+
+  idempotencyKey String @map("idempotency_key")
+  attemptNumber  Int    @map("attempt_number")
+
+  status String // pending | succeeded | failed | ambiguous — the one field mutated post-creation
+
+  retryable    Boolean? // only meaningful when status="failed" — whether the worker should let BullMQ retry (true) or escalate immediately (false)
+  errorClass   String?  @map("error_class")
+  errorMessage String?  @map("error_message")
+
+  requestMetadata  Json? @map("request_metadata") // non-sensitive summary only — never secrets/signed headers
+  responseMetadata Json? @map("response_metadata") // non-sensitive summary only
+
+  startedAt   DateTime  @default(now()) @map("started_at")
+  completedAt DateTime? @map("completed_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  tenant             Tenant             @relation(fields: [tenantId], references: [id])
+  email              Email              @relation(fields: [emailId], references: [id])
+  routingDecision    RoutingDecision    @relation(fields: [routingDecisionId], references: [id])
+  destinationChannel DestinationChannel @relation(fields: [destinationChannelId], references: [id])
+
+  @@index([idempotencyKey])
+  @@index([emailId])
+  // Phase 6: GET /api/v1/action-executions' tenant-wide, time-ordered listing.
+  @@index([tenantId, createdAt])
+  @@map("action_execution")
+}
+
+// --- Phase 9 (draft): Rule Graph foundation ---
+//
+// A branching execution model alongside the flat `Rule` model above. Live
+// since Phase 12: a mailbox with an enabled graph assigned is routed by it
+// (modules/rule-graphs/evaluateGraph.ts, called from
+// evaluateRulesForEmail.ts); every other mailbox still uses flat rules.
+//
+// A RuleNode's onTrue/onFalse each resolve to EITHER another RuleNode in the
+// same version (by `key`, see below) OR a placeholder "action" — a plain
+// destinationRef string, deliberately mirroring Rule.destinationRef's
+// existing semantics (dispatch-to-destination-or-"human_review") rather than
+// inventing a real Action entity ahead of a later phase. See
+// modules/rule-graphs/types.ts's BranchTarget for the exact shape.
+//
+// `key` vs `id`: `id` is the normal server-generated row identity (like
+// every other model here). `key` is a client-chosen, human-meaningful
+// identifier (e.g. "start", "check-domain") used INSIDE the onTrue/onFalse/
+// rootNodeKey JSON to reference a node — unique only within one
+// RuleGraphVersion (@@unique([graphVersionId, key])), not globally, so the
+// same key (e.g. "start") can be reused across versions of the same graph
+// without colliding on the primary key. References are plain strings
+// resolved at the application layer (modules/rule-graphs/graphValidation.ts),
+// not DB foreign keys — same reasoning as Rule.conditions already being JSON
+// rather than a relational tree: every node in a version is created together
+// in one transaction, so this keeps validation (missing/invalid references,
+// orphaned nodes, duplicate keys, cycles) in one place instead of fighting
+// FK-insertion ordering.
+model RuleGraph {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+
+  name    String
+  enabled Boolean @default(true)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant             Tenant              @relation(fields: [tenantId], references: [id])
+  versions           RuleGraphVersion[]
+  mailboxConnections MailboxConnection[]
+  routingDecisions   RoutingDecision[]
+
+  @@index([tenantId, enabled])
+  @@map("rule_graph")
+}
+
+model RuleGraphVersion {
+  id          String @id @default(uuid())
+  tenantId    String @map("tenant_id")
+  ruleGraphId String @map("rule_graph_id")
+
+  // Same versioning pattern as Rule/DestinationChannel: editing a graph
+  // creates a new version (this row's deactivatedAt set on the old one,
+  // never mutated) rather than rewriting nodes in place.
+  version Int
+
+  // The `key` (not `id`) of the RuleNode, within THIS version, where
+  // evaluation would start. Validated at save time to reference a real node
+  // in the same version — see the model-group header comment for why this
+  // isn't a DB FK.
+  rootNodeKey String @map("root_node_key")
+
+  deactivatedAt DateTime? @map("deactivated_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id])
+  ruleGraph RuleGraph  @relation(fields: [ruleGraphId], references: [id])
+  nodes     RuleNode[]
+
+  @@unique([ruleGraphId, version])
+  @@index([tenantId, ruleGraphId, deactivatedAt])
+  @@map("rule_graph_version")
+}
+
+model RuleNode {
+  id             String @id @default(uuid())
+  tenantId       String @map("tenant_id")
+  graphVersionId String @map("graph_version_id")
+
+  // Client-chosen, version-scoped reference — see the model-group header
+  // comment. NOT the row's `id`.
+  key String
+
+  // The exact same ConditionNode AST/shape as Rule.conditions
+  // (modules/rules/conditions.ts) — reused verbatim, never redefined or
+  // duplicated. A future graph-execution phase evaluates this with the same
+  // evaluateCondition() function Rule already uses.
+  conditions Json
+
+  // Each a BranchTarget: { type: "node"; nodeKey: string } |
+  // { type: "action"; destinationRef: string } — see
+  // modules/rule-graphs/types.ts. The "action" variant is an explicit,
+  // deliberately minimal placeholder — NOT the future full Action entity.
+  onTrue  Json @map("on_true")
+  onFalse Json @map("on_false")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant       Tenant           @relation(fields: [tenantId], references: [id])
+  graphVersion RuleGraphVersion @relation(fields: [graphVersionId], references: [id])
+
+  @@unique([graphVersionId, key])
+  @@index([graphVersionId])
+  @@map("rule_node")
+}
+
+// --- Phase 11: Authentication, Membership, granular permissions, TOTP MFA ---
+//
+// Closes the single most important gap flagged in this project's README: no
+// route previously verified WHO was making a request, only that a
+// client-supplied X-Organization-Id header named a real Tenant. See
+// api/plugins/tenantContext.ts for the resolver this phase rewrites, and
+// modules/auth/permissions.ts for the closed permission-string catalog
+// Membership.permissions is drawn from.
+model User {
+  id           String @id @default(uuid())
+  email        String @unique
+  passwordHash String @map("password_hash")
+
+  // Packed AES-256-GCM string ("v1.<iv>.<tag>.<ciphertext>"), same format and
+  // same SECRET_ENCRYPTION_KEY as modules/secrets/secretCrypto.ts — no second
+  // encryption scheme for TOTP secrets. Null until /auth/mfa/enroll; mfaEnabled
+  // only flips true after /auth/mfa/confirm (a bad QR scan must not silently
+  // lock someone out — enroll and confirm are deliberately two separate steps).
+  mfaSecret  String? @map("mfa_secret")
+  mfaEnabled Boolean @default(false) @map("mfa_enabled")
+
+  // Bypasses Membership entirely in tenantContext.ts/requirePermission — the
+  // "sees every organization" flag from this phase's original ask, for the
+  // person operating the whole system rather than a member of any one org.
+  isSuperAdmin Boolean @default(false) @map("is_super_admin")
+  // Phase 21: interface and email language ("en" | "tr"); null = follow the browser.
+  locale       String?
+
+  // active | disabled — same plain-string-status convention as
+  // Tenant/MailboxConnection/Rule/DestinationChannel. Disabling (not
+  // deleting) blocks login without destroying Membership/AuditEvent history.
+  status String @default("active")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  memberships Membership[]
+  authEvents  AuthEvent[]
+
+  // "user" is an awkward/reserved identifier in some Postgres tooling —
+  // mapped to app_user the same defensive way Tenant avoided an ambiguous
+  // table name. The Prisma model name itself stays the natural `User`.
+  @@map("app_user")
+}
+
+model Membership {
+  id       String @id @default(uuid())
+  userId   String @map("user_id")
+  tenantId String @map("tenant_id")
+
+  // Drawn from the closed PERMISSION_CATALOG (modules/auth/permissions.ts) —
+  // e.g. ["mailboxes:read","rules:write"]. Edited as one atomic set per
+  // invite/update-permissions call, never queried independently of "which
+  // permissions does THIS membership have" — a join table would add
+  // transactional complexity for no real benefit, the same judgment behind
+  // Rule.conditions being a Json tree rather than a normalized structure.
+  permissions String[]
+
+  // pending (invited, not yet accepted) | active | revoked (soft — never a
+  // hard delete, same convention as every other resource in this schema).
+  status String @default("pending")
+
+  // The RAW invite token is shown once (in the invite-creation API response)
+  // and never stored — only its SHA-256 hash lives here, the same
+  // "never persist the sensitive value itself" posture as
+  // MailboxCredential/DestinationSecret (those encrypt for later retrieval; a
+  // one-time bearer token is instead hashed, since it only ever needs
+  // equality-checking, not recovery).
+  inviteTokenHash String?   @map("invite_token_hash")
+  inviteExpiresAt DateTime? @map("invite_expires_at")
+
+  invitedAt  DateTime  @default(now()) @map("invited_at")
+  acceptedAt DateTime? @map("accepted_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user   User   @relation(fields: [userId], references: [id])
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  // THE membership-lookup key — tenantContext.ts and requirePermission both
+  // query by (userId, tenantId), never by id alone.
+  @@unique([userId, tenantId])
+  @@index([tenantId, status])
+  @@map("membership")
+}
+
+// Pre-tenant-context auth events (login/logout/MFA/invite lifecycle) —
+// deliberately NOT AuditEvent rows: AuditEvent.tenantId is required (it
+// always describes something that happened WITHIN a resolved tenant), but a
+// failed login attempt has no tenant yet — authContext resolves request.user
+// BEFORE tenantContext ever runs. A second, lightweight, differently-scoped
+// log is simpler than forcing a nullable tenantId onto the well-established
+// AuditEvent table for this one pre-tenant case.
+model AuthEvent {
+  id     String  @id @default(uuid())
+  userId String? @map("user_id") // null for "unknown email" login failures — no User row to reference
+
+  // login_succeeded | login_failed | mfa_challenge_issued | mfa_succeeded |
+  // mfa_failed | logout | mfa_enrolled | mfa_disabled | invite_sent |
+  // invite_accepted | bootstrap_admin_created — free-text, same reasoning as
+  // AuditEvent.eventType: new event types are added without a migration.
+  eventType String @map("event_type")
+
+  // Non-sensitive context only (e.g. { ip, userAgent }) — NEVER a password,
+  // TOTP code, or session/invite token, matching every existing secret's
+  // "never logged, never in a payload" rule.
+  payload Json?
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([userId, createdAt])
+  @@map("auth_event")
+}
+
+// --- Phase 11.2: UI-editable system settings ---
+//
+// A genuine singleton (exactly one row, enforced at the application layer by
+// modules/settings/systemSettings.ts's getSystemSettings() — find-or-create,
+// same idempotent-seed idiom as ensureBootstrapAdminUser) for the small set
+// of operational settings that are global (not per-organization) and were
+// previously env-var-only: outbound SMTP, the invite-link base URL, session
+// lifetime, and the mailbox sync interval. The corresponding env vars
+// (config/env.ts) now only SEED this row once on first read if it doesn't
+// exist yet — after that, this table is authoritative and editable at
+// runtime from the Settings page (superAdmin-only, GET/PATCH
+// /api/v1/settings) with NO server restart required. Deliberately NOT
+// everything that lives in env.ts: DATABASE_URL/REDIS_URL/SECRET_ENCRYPTION_KEY
+// and similar are needed just to connect to the very database this table
+// lives in, so they structurally cannot be made UI-editable — see this
+// phase's own report for that reasoning.
+model SystemSettings {
+  id String @id @default(uuid())
+
+  appBaseUrl                 String @default("http://localhost:3001") @map("app_base_url")
+  sessionTtlSeconds          Int    @default(86400) @map("session_ttl_seconds")
+  mailboxSyncIntervalSeconds Int    @default(60) @map("mailbox_sync_interval_seconds")
+
+  smtpHost              String? @map("smtp_host")
+  smtpPort              Int     @default(587) @map("smtp_port")
+  smtpSecure            Boolean @default(false) @map("smtp_secure")
+  smtpUsername          String? @map("smtp_username")
+  // Packed AES-256-GCM string, same format/key as modules/secrets/secretCrypto.ts
+  // — resolved to plaintext ONLY by modules/settings/systemSettings.ts's
+  // resolveSmtpPassword(), mirroring resolveMailboxPassword()'s "one internal
+  // resolution point" contract exactly. Never returned by GET /api/v1/settings.
+  smtpPasswordEncrypted String? @map("smtp_password_encrypted")
+  smtpFromAddress       String? @map("smtp_from_address")
+  smtpFromName          String  @default("Eumaeus") @map("smtp_from_name")
+
+  // Phase 13: how long the original MIME source (EmailSource) is kept. 0 =
+  // never stored (forwarding then falls back to the stored text/HTML bodies,
+  // without attachments).
+  rawSourceRetentionDays Int @default(14) @map("raw_source_retention_days")
+
+  // Phase 17: OAuth apps for connecting Gmail / Microsoft 365 mailboxes
+  // without app passwords. Secrets are packed AES-256-GCM (secretCrypto.ts)
+  // and never returned by the API.
+  googleOAuthClientId                 String?  @map("google_oauth_client_id")
+  googleOAuthClientSecretEncrypted    String?  @map("google_oauth_client_secret_encrypted")
+  microsoftOAuthClientId              String?  @map("microsoft_oauth_client_id")
+  microsoftOAuthClientSecretEncrypted String?  @map("microsoft_oauth_client_secret_encrypted")
+  // "common" (any account), "organizations", or one Azure tenant id.
+  microsoftOAuthTenant                String   @default("common") @map("microsoft_oauth_tenant")
+  // Phase 20: signing in to Eumaeus itself with the same Google / Microsoft
+  // apps. Only people who already have a Eumaeus account can sign in; an
+  // empty domain list means any domain.
+  ssoGoogleEnabled                    Boolean  @default(false) @map("sso_google_enabled")
+  ssoMicrosoftEnabled                 Boolean  @default(false) @map("sso_microsoft_enabled")
+  ssoAllowedDomains                   String[] @default([]) @map("sso_allowed_domains")
+
+  updatedAt DateTime @updatedAt @map("updated_at")
+  // Email of the admin who last changed a setting — free text (like
+  // AuditEvent.actor), not a User FK, so this survives that user's account
+  // being deleted later.
+  updatedBy String?  @map("updated_by")
+
+  @@map("system_settings")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 13 — forwarding
+// ---------------------------------------------------------------------------
+
+// The original MIME bytes of an ingested message, kept for a bounded time
+// (SystemSettings.rawSourceRetentionDays) so the forward executor never has
+// to read the message back from IMAP. It can't rely on IMAP: a destination's
+// channels run in parallel, so an "archive" channel in the same destination
+// may already have moved the message out of the folder it was ingested from.
+// Purged by the maintenance queue once expiresAt passes.
+model EmailSource {
+  emailId   String   @id @map("email_id")
+  tenantId  String   @map("tenant_id")
+  source    Bytes
+  sizeBytes Int      @map("size_bytes")
+  createdAt DateTime @default(now()) @map("created_at")
+  expiresAt DateTime @map("expires_at")
+
+  email  Email  @relation(fields: [emailId], references: [id], onDelete: Cascade)
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([expiresAt])
+  @@map("email_source")
+}
+
+// An address a forward channel may send to. Every new address must be
+// confirmed by its owner (a link emailed to it) before anything is forwarded
+// there — nobody can start sending an organization's mail to an address that
+// never agreed to receive it. Address is stored lowercased.
+model ForwardRecipient {
+  id             String    @id @default(uuid())
+  tenantId       String    @map("tenant_id")
+  address        String
+  status         String    @default("pending") // pending | verified | revoked
+  tokenHash      String?   @map("token_hash") // SHA-256 of the raw token, same scheme as Membership invites
+  tokenExpiresAt DateTime? @map("token_expires_at")
+  requestedBy    String?   @map("requested_by")
+  verifiedAt     DateTime? @map("verified_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, address])
+  @@index([tokenHash])
+  @@map("forward_recipient")
+}
+
+// Phase 13.4: a forward channel with delivery "digest" doesn't send each email
+// on its own — the executor queues it here, and the forward-digest queue
+// sends every queued email of a channel as ONE message once the channel's
+// interval has passed (modules/destinations/forwardDigest.ts).
+model ForwardDigestItem {
+  id                   String   @id @default(uuid())
+  tenantId             String   @map("tenant_id")
+  destinationChannelId String   @map("destination_channel_id")
+  emailId              String   @map("email_id")
+  // queued -> batched (claimed by a ForwardDigestBatch) | cancelled (channel disabled)
+  status               String   @default("queued")
+  batchId              String?  @map("batch_id")
+  queuedAt             DateTime @default(now()) @map("queued_at")
+
+  tenant             Tenant              @relation(fields: [tenantId], references: [id])
+  destinationChannel DestinationChannel  @relation(fields: [destinationChannelId], references: [id])
+  email              Email               @relation(fields: [emailId], references: [id])
+  batch              ForwardDigestBatch? @relation(fields: [batchId], references: [id])
+
+  // One queue entry per email per channel: a retried execute-action job re-queues nothing.
+  @@unique([destinationChannelId, emailId])
+  @@index([destinationChannelId, status, queuedAt])
+  @@map("forward_digest_item")
+}
+
+// One digest message. "sending" is written BEFORE the SMTP call, so a crash
+// mid-send leaves evidence that is later resolved as ambiguous (never resent).
+model ForwardDigestBatch {
+  id                   String    @id @default(uuid())
+  tenantId             String    @map("tenant_id")
+  destinationChannelId String    @map("destination_channel_id")
+  status               String // sending | sent | failed | ambiguous
+  itemCount            Int       @map("item_count")
+  messageId            String?   @map("message_id")
+  errorClass           String?   @map("error_class")
+  errorMessage         String?   @map("error_message")
+  createdAt            DateTime  @default(now()) @map("created_at")
+  completedAt          DateTime? @map("completed_at")
+
+  tenant             Tenant              @relation(fields: [tenantId], references: [id])
+  destinationChannel DestinationChannel  @relation(fields: [destinationChannelId], references: [id])
+  items              ForwardDigestItem[]
+
+  @@index([destinationChannelId, createdAt])
+  @@index([tenantId, status, completedAt])
+  @@map("forward_digest_batch")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 15 — undoing a move
+// ---------------------------------------------------------------------------
+
+// Undoing an archive moves the message back into the folder Eumaeus watches,
+// where the server gives it a NEW UID. Without this row the next sync would
+// ingest it as a brand-new email and route it again — most likely straight
+// back where it was undone from. Ingestion (modules/ingestion/persist.ts)
+// matches a reappearing message against an open suppression (by new UID when
+// the server reported it, otherwise by Message-ID), re-points the existing
+// Email at the new UID, and does not process it again.
+model IngestionSuppression {
+  id                  String    @id @default(uuid())
+  tenantId            String    @map("tenant_id")
+  mailboxConnectionId String    @map("mailbox_connection_id")
+  emailId             String    @map("email_id")
+  messageId           String?   @map("message_id")
+  uidValidity         Int?      @map("uid_validity")
+  uid                 Int?
+  expiresAt           DateTime  @map("expires_at")
+  consumedAt          DateTime? @map("consumed_at")
+  createdAt           DateTime  @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  email  Email  @relation(fields: [emailId], references: [id])
+
+  @@index([mailboxConnectionId, messageId])
+  @@index([mailboxConnectionId, uidValidity, uid])
+  @@index([emailId])
+  @@map("ingestion_suppression")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 16 — sender lists and suggestions
+// ---------------------------------------------------------------------------
+
+// A sender pattern checked before anything else (modules/rules/decideRouting.ts).
+// "allow" (VIP): the email is left alone — no action, no Human Review.
+// "block": the email goes to the organization's blockDestinationRef.
+// pattern is lowercase: a full address, or "@domain" (also matches its subdomains).
+model SenderListEntry {
+  id        String   @id @default(uuid())
+  tenantId  String   @map("tenant_id")
+  kind      String // allow | block
+  pattern   String
+  note      String?
+  source    String   @default("manual") // manual | suggestion
+  createdBy String?  @map("created_by")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  // One entry per pattern: a sender can't be both allowed and blocked.
+  @@unique([tenantId, pattern])
+  @@map("sender_list_entry")
+}
+
+// A proposal computed from resolved Human Review items (modules/review/suggestions.ts):
+// "5 of 5 emails from this sender were marked spam — block it?"
+model RoutingSuggestion {
+  id            String    @id @default(uuid())
+  tenantId      String    @map("tenant_id")
+  kind          String // allow | block
+  pattern       String
+  resolvedCount Int       @map("resolved_count")
+  spamCount     Int       @map("spam_count")
+  approvedCount Int       @map("approved_count")
+  status        String    @default("open") // open | accepted | dismissed
+  decidedBy     String?   @map("decided_by")
+  decidedAt     DateTime? @map("decided_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, pattern])
+  @@index([tenantId, status])
+  @@map("routing_suggestion")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 17 — OAuth mailboxes
+// ---------------------------------------------------------------------------
+
+// The tokens of a mailbox connected with Google or Microsoft. Both tokens are
+// packed AES-256-GCM (same key and format as every other secret). The access
+// token is refreshed shortly before it expires (modules/mail-providers/oauth/tokens.ts).
+model MailboxOAuthToken {
+  mailboxConnectionId   String    @id @map("mailbox_connection_id")
+  tenantId              String    @map("tenant_id")
+  provider              String // google | microsoft
+  refreshTokenEncrypted String    @map("refresh_token_encrypted")
+  accessTokenEncrypted  String?   @map("access_token_encrypted")
+  accessTokenExpiresAt  DateTime? @map("access_token_expires_at")
+  scope                 String?
+  createdAt             DateTime  @default(now()) @map("created_at")
+  updatedAt             DateTime  @updatedAt @map("updated_at")
+
+  mailboxConnection MailboxConnection @relation(fields: [mailboxConnectionId], references: [id])
+  tenant            Tenant            @relation(fields: [tenantId], references: [id])
+
+  @@map("mailbox_oauth_token")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 18 — operational alerts
+// ---------------------------------------------------------------------------
+
+// Something needs a person's attention (modules/alerts/evaluateAlerts.ts):
+// a mailbox that keeps failing to sync, a sign-in that expired, a burst of
+// failed actions or Jev errors, forwards that can't be sent. One OPEN row per
+// (tenant, kind, subject); it's resolved automatically when the condition
+// clears, and people are told once when it opens and once when it resolves.
+model Alert {
+  id             String    @id @default(uuid())
+  tenantId       String    @map("tenant_id")
+  kind           String
+  // What it's about, e.g. a mailbox id; "" for organization-wide conditions.
+  subjectKey     String    @default("") @map("subject_key")
+  status         String    @default("open") // open | dismissed | resolved
+  // English text, kept for the webhook payload and alerts saved before 1.2.
+  title          String
+  detail         String
+  // 1.2 (E): the values the title and detail are built from, so the web app
+  // and the alert email can say it in the reader's language (keyed by kind).
+  params         Json?
+  firstSeenAt    DateTime  @default(now()) @map("first_seen_at")
+  lastSeenAt     DateTime  @default(now()) @map("last_seen_at")
+  lastNotifiedAt DateTime? @map("last_notified_at")
+  resolvedAt     DateTime? @map("resolved_at")
+  // Closed by a person while the problem was still there (status "dismissed"):
+  // it stays quiet until the problem clears; a new occurrence opens a new alert.
+  dismissedAt    DateTime? @map("dismissed_at")
+  dismissedBy    String?   @map("dismissed_by")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId, status])
+  @@index([tenantId, kind, subjectKey, status])
+  @@map("alert")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 19 — auto-reply
+// ---------------------------------------------------------------------------
+
+// When a destination's auto-reply last answered an address: the cooldown
+// ("at most one reply per sender every N days") is checked against this.
+model AutoReplyRecord {
+  id            String   @id @default(uuid())
+  tenantId      String   @map("tenant_id")
+  destinationId String   @map("destination_id")
+  recipient     String
+  lastSentAt    DateTime @map("last_sent_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, destinationId, recipient])
+  @@map("auto_reply_record")
+}
+
+// Phase 20: API keys. A key belongs to one organization and carries its own
+// permission list (never more than its creator had). Only a SHA-256 of the
+// whole key is stored; the key itself is shown once at creation. `prefix` is
+// the visible start ("jm_ab12cd34") so people can tell keys apart.
+model ApiKey {
+  id          String    @id @default(uuid())
+  tenantId    String    @map("tenant_id")
+  name        String
+  prefix      String
+  keyHash     String    @unique @map("key_hash")
+  permissions String[]
+  createdBy   String    @map("created_by")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  expiresAt   DateTime? @map("expires_at")
+  lastUsedAt  DateTime? @map("last_used_at")
+  revokedAt   DateTime? @map("revoked_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@map("api_key")
+}
+
+// Phase 22: an organization's own questions for Jev, asked about every email
+// alongside the built-in eight. `key` becomes the rule field answers.<key>;
+// key and type never change after creation (rules depend on the answer's
+// shape). Deleted questions are kept (status "deleted") so old analyses and
+// the audit trail still make sense.
+model TenantQuestion {
+  id           String    @id @default(uuid())
+  tenantId     String    @map("tenant_id")
+  key          String
+  type         String // noul | choice | score
+  instructions String
+  // choice: { option: description }; score: ["level", ...]; noul: { true?, false? } or null
+  criteria     Json?
+  status       String    @default("active") // active | deleted
+  createdBy    String    @map("created_by")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+  deletedAt    DateTime? @map("deleted_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, key])
+  @@index([tenantId, status])
+  @@map("tenant_question")
+}
+
+// 1.2 (F): every email Eumaeus sends — system emails (alerts, digests,
+// invites, the worker watchdog) and channel sends (forward, auto-reply,
+// rule notifications) — with its outcome. The body is never stored: this is
+// a delivery log, not a mail archive. Kept 90 days (maintenance).
+model OutboundEmail {
+  id        String   @id @default(uuid())
+  // null = a system-level email (worker watchdog, SMTP test).
+  tenantId  String?  @map("tenant_id")
+  // alert | review_digest | assignment | invite | forward_verification |
+  // worker | smtp_test | forward | forward_digest | auto_reply | rule_notify | other
+  kind      String
+  toAddress String   @map("to_address")
+  subject   String
+  status    String // sent | failed
+  error     String?
+  messageId String?  @map("message_id")
+  // What it was about (an email, alert or destination id), when there is one.
+  relatedId String?  @map("related_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId, createdAt])
+  @@index([createdAt])
+  @@map("outbound_email")
+}
+
+// 1.2 (O): "email_notify" channels that don't send one notice per email.
+// A throttled channel sends at once when it may and queues the rest for the
+// next notice; a digest channel always queues. The forward-digest tick
+// (every few minutes) sends what is due. An email that is deleted takes its
+// queue entry with it.
+model NotifyQueueItem {
+  id                   String   @id @default(uuid())
+  tenantId             String   @map("tenant_id")
+  destinationChannelId String   @map("destination_channel_id")
+  emailId              String   @map("email_id")
+  queuedAt             DateTime @default(now()) @map("queued_at")
+
+  tenant             Tenant             @relation(fields: [tenantId], references: [id])
+  destinationChannel DestinationChannel @relation(fields: [destinationChannelId], references: [id])
+  email              Email              @relation(fields: [emailId], references: [id], onDelete: Cascade)
+
+  @@unique([destinationChannelId, emailId])
+  @@index([destinationChannelId, queuedAt])
+  @@map("notify_queue_item")
+}
+
+// When an "email_notify" channel last sent a notice (for throttle and digest timing).
+model NotifyChannelState {
+  destinationChannelId String   @id @map("destination_channel_id")
+  tenantId             String   @map("tenant_id")
+  lastSentAt           DateTime @map("last_sent_at")
+
+  tenant             Tenant             @relation(fields: [tenantId], references: [id])
+  destinationChannel DestinationChannel @relation(fields: [destinationChannelId], references: [id])
+
+  @@map("notify_channel_state")
+}

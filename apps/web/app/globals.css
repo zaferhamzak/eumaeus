@@ -1,0 +1,250 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Inter:wght@400;500;600;650;700&display=swap");
+@import "tailwindcss";
+
+/*
+ * Design language adopted from `New UI/Email Security Operations Control
+ * Plane` (a Figma Make visual reference — see components/layout/Sidebar.tsx
+ * and Topbar.tsx for how its shell pattern was mapped onto this app's real
+ * routes and data). Token NAMES are unchanged from Phase 8 so every existing
+ * component (Badge, Button, Card, StatusBadge, ...) picks up the new palette
+ * automatically; only the color VALUES and fonts moved. Status colors remain
+ * semantic tokens — StatusBadge (components/ui/StatusBadge.tsx) is still the
+ * ONE place that maps a backend state string to a color.
+ */
+:root {
+  /* "Pine & Clay" (0.31): the pine greens and sage neutrals stay as the
+     ground; Claude's orange is the accent — primary actions, the selected
+     nav item, what's waiting. Green now means "all good" only. The accent
+     has two steps: --accent (#b4532f, 5.0:1 with white text) for buttons and
+     links, --accent-bright (#d97757, Claude orange) for marks and highlights
+     that carry no small text. */
+  --background: #f3f6f4;
+  --surface: #eef2ef;
+  --surface-raised: #ffffff;
+  --border: #dce3df;
+  --border-strong: #c6cfca;
+  --foreground: #16211c;
+  --foreground-muted: #5b6963;
+  --foreground-subtle: #7d8a84;
+  --accent: #b4532f;
+  --accent-bright: #d97757;
+  --accent-soft: #fbe9e1;
+  --accent-foreground: #ffffff;
+
+  /* The sidebar is dark in both themes ("night pine"). */
+  --sidebar: #10201a;
+  --sidebar-foreground: #d9e4de;
+  --sidebar-muted: #8fa39a;
+  --sidebar-label: #647a70;
+  --sidebar-hover: #182b23;
+  --sidebar-border: rgba(255, 255, 255, 0.08);
+
+  /* Logo (Nöbetçi): the badge behind the wolf. */
+  --logo-badge: #10201a;
+
+  --status-neutral-bg: #edf1ee;
+  --status-neutral-fg: #53615b;
+  --status-info-bg: #e3ecfb;
+  --status-info-fg: #1f4fbf;
+  --status-success-bg: #e3f2eb;
+  --status-success-fg: #0b6146;
+  /* Warning is mustard, not orange — orange is the accent now. */
+  --status-warning-bg: #fdf3cf;
+  --status-warning-fg: #7d5a00;
+  --status-danger-bg: #fbe7e4;
+  --status-danger-fg: #a3271d;
+
+  /* Report charts — green/orange pair re-picked for the new accent and
+     validated with the dataviz palette checker (lightness band, chroma, CVD
+     and normal-vision separation, contrast) against the light surface. */
+  --chart-1: #047857;
+  --chart-2: #e3905f;
+
+  /* Native form controls follow the theme (see "Native form controls" below). */
+  color-scheme: light;
+  accent-color: var(--accent);
+  --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M3 4.5 6 7.5 9 4.5' fill='none' stroke='%235b6963' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0c1411;
+    --surface: #111b17;
+    --surface-raised: #16221d;
+    --border: #243029;
+    --border-strong: #324039;
+    --foreground: #e8efeb;
+    --foreground-muted: #9aa9a2;
+    --foreground-subtle: #7b8a84;
+    --accent: #e08a67;
+    --accent-bright: #eb9a78;
+    --accent-soft: #3a2218;
+    --accent-foreground: #1b0e08;
+
+    --sidebar: #09100d;
+    --sidebar-foreground: #d9e4de;
+    --sidebar-muted: #7f938a;
+    --sidebar-label: #5a6c64;
+    --sidebar-hover: #121d18;
+    --sidebar-border: rgba(255, 255, 255, 0.07);
+
+    --logo-badge: #0f6b4f;
+
+    --status-neutral-bg: #1c2622;
+    --status-neutral-fg: #9aa9a2;
+    --status-info-bg: #172c56;
+    --status-info-fg: #9dbcf5;
+    --status-success-bg: #12352a;
+    --status-success-fg: #6fd0a8;
+    --status-warning-bg: #3a2f0c;
+    --status-warning-fg: #e6c35c;
+    --status-danger-bg: #3d1a17;
+    --status-danger-fg: #f09a90;
+
+    /* Same pair, re-stepped and re-validated against the dark surface. */
+    --chart-1: #00805a;
+    --chart-2: #d27b4b;
+
+    color-scheme: dark;
+    --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M3 4.5 6 7.5 9 4.5' fill='none' stroke='%239aa9a2' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  }
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-foreground: var(--foreground);
+  --color-foreground-muted: var(--foreground-muted);
+  --color-foreground-subtle: var(--foreground-subtle);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent-bright: var(--accent-bright);
+  --color-accent-soft: var(--accent-soft);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-muted: var(--sidebar-muted);
+  --color-sidebar-label: var(--sidebar-label);
+  --color-sidebar-hover: var(--sidebar-hover);
+  --color-sidebar-border: var(--sidebar-border);
+
+  --color-status-neutral-bg: var(--status-neutral-bg);
+  --color-status-neutral-fg: var(--status-neutral-fg);
+  --color-status-info-bg: var(--status-info-bg);
+  --color-status-info-fg: var(--status-info-fg);
+  --color-status-success-bg: var(--status-success-bg);
+  --color-status-success-fg: var(--status-success-fg);
+  --color-status-warning-bg: var(--status-warning-bg);
+  --color-status-warning-fg: var(--status-warning-fg);
+  --color-status-danger-bg: var(--status-danger-bg);
+  --color-status-danger-fg: var(--status-danger-fg);
+
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+body {
+  background: var(--color-background);
+  color: var(--color-foreground);
+  font-family: var(--font-sans);
+}
+
+/* A visible, consistent focus ring everywhere (§32 accessibility — never rely on browser default outline alone, but never remove it without replacing it). */
+:focus-visible {
+  outline: 2px solid var(--color-accent-bright);
+  outline-offset: 2px;
+}
+
+/*
+ * Native form controls. Left alone, each browser draws these its own way —
+ * Safari's grey rounded "button" selects that stay light in dark mode, blue
+ * sliders and radios, invisible date-picker icons on a dark surface. These
+ * rules are deliberately OUTSIDE Tailwind's layers so they win over a
+ * component's px-* on the one property that must not be overridden (room for
+ * the chevron); colors, borders and sizes still come from each component's
+ * own utility classes.
+ */
+select:not([multiple]):not([size]) {
+  -webkit-appearance: none;
+  appearance: none;
+  background-image: var(--select-chevron);
+  background-repeat: no-repeat;
+  background-position: right 0.5rem center;
+  background-size: 0.75rem;
+  padding-right: 1.75rem;
+}
+select option {
+  background-color: var(--surface-raised);
+  color: var(--foreground);
+}
+
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  height: 1.25rem;
+  cursor: pointer;
+  --range-fill: var(--accent);
+  --range-rest: var(--border-strong);
+}
+input[type="range"]:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: linear-gradient(to right, var(--range-fill) var(--range-pct, 50%), var(--range-rest) var(--range-pct, 50%));
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -5px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--surface-raised);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+input[type="range"]::-moz-range-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--range-rest);
+}
+input[type="range"]::-moz-range-progress {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--range-fill);
+}
+input[type="range"]::-moz-range-thumb {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--surface-raised);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+input[type="file"]::file-selector-button {
+  margin-right: 0.75rem;
+  padding: 0.375rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.375rem;
+  background: var(--surface-raised);
+  color: var(--foreground);
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+}
+input[type="file"]::file-selector-button:hover {
+  background: var(--surface);
+}
+
+input[type="date"]::-webkit-calendar-picker-indicator,
+input[type="time"]::-webkit-calendar-picker-indicator {
+  cursor: pointer;
+  opacity: 0.7;
+}

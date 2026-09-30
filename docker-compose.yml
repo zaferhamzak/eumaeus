@@ -1,0 +1,24 @@
+# Optional local dev alternative to native Postgres/Redis (see implementation-plan.md §W).
+# This machine did not have Docker installed during Phase 1 implementation, so Postgres 16
+# and Redis were set up as native Homebrew services instead (see README commands in the
+# phase 1 report). This file is provided so `docker compose up -d` works once Docker is
+# available, without requiring any code changes.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: jev_mail
+      POSTGRES_PASSWORD: jev_mail
+      POSTGRES_DB: jev_mail_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - jev_mail_pg_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+volumes:
+  jev_mail_pg_data:

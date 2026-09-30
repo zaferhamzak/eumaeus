@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.env
+.env.local
+.vercel/
+*.log
+.DS_Store
+apps/api/prisma/generated/
+coverage/
+deploy/.env
+deploy/backups/
+.release-denylist
+.env.*
+!.env.example
+.run/

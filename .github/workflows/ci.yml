@@ -1,0 +1,85 @@
+# Eumaeus CI (1.1 H): every push and pull request — install, migrate a fresh
+# test database, typecheck, lint, API and web tests, the production builds
+# and both Docker images (built, not pushed). No secrets are needed: the test
+# suite never calls a real IMAP, SMTP or Jev service (test/setup.ts).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: eumaeus
+          POSTGRES_PASSWORD: eumaeus
+          POSTGRES_DB: eumaeus_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U eumaeus" --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://eumaeus:eumaeus@localhost:5432/eumaeus_test
+      DATABASE_URL_TEST: postgresql://eumaeus:eumaeus@localhost:5432/eumaeus_test
+      REDIS_URL: redis://localhost:6379
+      # Placeholders for env validation during build and typecheck only.
+      JEV_API_KEY: ci-not-a-real-key
+      SECRET_ENCRYPTION_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Migrate the test database
+        run: pnpm --filter api exec prisma migrate deploy && pnpm --filter api exec prisma generate
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - name: API tests
+        run: pnpm --filter api test
+      - name: Web tests
+        run: pnpm --filter web test
+      - name: Production builds
+        run: pnpm build
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          push: false
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+      - name: Web image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/web/Dockerfile
+          push: false
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
